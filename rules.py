@@ -1,206 +1,223 @@
 """
-rules.py  -  Knowledge base + inference engine
-Launch Go/No-Go Expert System
+rules.py  -  The "brain" of the Launch Go/No-Go Expert System.
 
-Every rule has the form:   IF <condition on facts> THEN <HOLD or SCRUB>
-If no rule fires the decision is GO.
+Every rule is a plain IF statement:
+    IF <condition is true> THEN add a reason to the HOLD list or the SCRUB list.
+
+Final decision:
+    any SCRUB reason  -> SCRUB
+    else any HOLD     -> HOLD
+    else              -> GO
+
 Thresholds are simplified and inspired by public launch commit criteria
 (educational use only).
 """
 
-# ---------------------------------------------------------------------------
-# 1. FACTS  (working memory)  -  default values describe a "Perfect Day"
-# ---------------------------------------------------------------------------
-DEFAULTS = {
-    # Weather
-    "wind_speed": 12,            # knots
-    "wind_gust": 18,             # knots
-    "wind_shear_severe": False,
-    "lightning_distance": 50,    # nautical miles (50 = none nearby)
-    "thunderstorm": False,
-    "cloud_ceiling": 12000,      # feet
-    "visibility": 10.0,          # miles
-    "temperature": 24,           # degrees C
-    "rain": False,
-    "tropical_warning": False,
-    "sea_state": 2,              # 0-9 scale (recovery area)
-    "solar_storm": False,
-    # Propulsion and fuel
-    "fuel_leak": False,
-    "tank_pressure": 225,        # psi
-    "propellant_temp": -183,     # degrees C
-    "oxidizer_loaded": True,
-    "chilldown_done": True,
-    "valve_fault": False,
-    "helium_pressure": 3800,     # psi
-    "ignition_sensor_fault": False,
-    "fuel_level": 100,           # percent
-    # Vehicle systems
-    "telemetry_ok": True,
-    "guidance_fault": False,
-    "avionics_ok": True,
-    "battery": 100,              # percent
-    "fts_armed": True,           # flight termination system
-    "structural_anomaly": False,
-    "nav_aligned": True,
-    "payload_ready": True,
-    "software_mismatch": False,
-    "backup_computer_synced": True,
-    # Range safety
-    "boat_in_zone": False,
-    "aircraft_in_zone": False,
-    "radar_ok": True,
-    "range_comms_ok": True,
-    "termination_link_ok": True,
-    "drone_detected": False,
-    "downrange_ship_traffic": False,
-    "rso_go": True,              # range safety officer
-    "recovery_ship_ready": True,
-    # Ground systems
-    "ground_power_ok": True,
-    "control_comms_ok": True,
-    "fire_suppression_ok": True,
-    "deluge_ok": True,
-    "personnel_clear": True,
-    "hazard_gas": False,
-    "backup_power_ok": True,
-    "staffing_complete": True,
-    "umbilical_fault": False,
-    # Launch window
-    "minutes_to_close": 45,      # minutes until window closes
-    "clock_fault": False,
-    "orbital_error": 0.1,        # degrees
-    "holds_used": 0,
-    "total_hold_minutes": 0,
-}
-
-# ---------------------------------------------------------------------------
-# 2. KNOWLEDGE BASE  -  (id, category, description, result, condition)
-# ---------------------------------------------------------------------------
-RULES = [
-    # ---------------- Weather (13) ----------------
-    ("W1", "Weather", "Wind speed above 30 kt", "HOLD", lambda f: f["wind_speed"] > 30),
-    ("W2", "Weather", "Wind gusts above 35 kt", "HOLD", lambda f: f["wind_gust"] > 35),
-    ("W3", "Weather", "Severe upper-level wind shear", "SCRUB", lambda f: f["wind_shear_severe"]),
-    ("W4", "Weather", "Lightning within 10 nm", "HOLD", lambda f: f["lightning_distance"] < 10),
-    ("W5", "Weather", "Thunderstorm in launch area", "HOLD", lambda f: f["thunderstorm"]),
-    ("W6", "Weather", "Cloud ceiling below 6,000 ft", "HOLD", lambda f: f["cloud_ceiling"] < 6000),
-    ("W7", "Weather", "Visibility below 4 miles", "HOLD", lambda f: f["visibility"] < 4),
-    ("W8", "Weather", "Temperature below 2 C", "HOLD", lambda f: f["temperature"] < 2),
-    ("W9", "Weather", "Temperature above 35 C", "HOLD", lambda f: f["temperature"] > 35),
-    ("W10", "Weather", "Rain at launch site", "HOLD", lambda f: f["rain"]),
-    ("W11", "Weather", "Tropical storm / hurricane warning", "SCRUB", lambda f: f["tropical_warning"]),
-    ("W12", "Weather", "Sea state above 5 in recovery area", "HOLD", lambda f: f["sea_state"] > 5),
-    ("W13", "Weather", "Severe solar / geomagnetic storm", "HOLD", lambda f: f["solar_storm"]),
-
-    # ---------------- Propulsion and fuel (9) ----------------
-    ("P1", "Propulsion", "Fuel leak detected", "SCRUB", lambda f: f["fuel_leak"]),
-    ("P2", "Propulsion", "Tank pressure outside 210-240 psi", "HOLD",
-     lambda f: not (210 <= f["tank_pressure"] <= 240)),
-    ("P3", "Propulsion", "Propellant temperature outside -186 to -180 C", "HOLD",
-     lambda f: not (-186 <= f["propellant_temp"] <= -180)),
-    ("P4", "Propulsion", "Oxidizer loading incomplete", "HOLD", lambda f: not f["oxidizer_loaded"]),
-    ("P5", "Propulsion", "Engine chilldown incomplete", "HOLD", lambda f: not f["chilldown_done"]),
-    ("P6", "Propulsion", "Main valve fault", "SCRUB", lambda f: f["valve_fault"]),
-    ("P7", "Propulsion", "Helium pressurant below 3,000 psi", "HOLD", lambda f: f["helium_pressure"] < 3000),
-    ("P8", "Propulsion", "Ignition sensor fault", "SCRUB", lambda f: f["ignition_sensor_fault"]),
-    ("P9", "Propulsion", "Fuel level below 98 percent", "HOLD", lambda f: f["fuel_level"] < 98),
-
-    # ---------------- Vehicle systems (10) ----------------
-    ("V1", "Vehicle", "Telemetry lost", "HOLD", lambda f: not f["telemetry_ok"]),
-    ("V2", "Vehicle", "Guidance computer fault", "SCRUB", lambda f: f["guidance_fault"]),
-    ("V3", "Vehicle", "Avionics self-check failed", "HOLD", lambda f: not f["avionics_ok"]),
-    ("V4", "Vehicle", "Battery charge below 90 percent", "HOLD", lambda f: f["battery"] < 90),
-    ("V5", "Vehicle", "Flight termination system not armed", "SCRUB", lambda f: not f["fts_armed"]),
-    ("V6", "Vehicle", "Structural sensor anomaly", "SCRUB", lambda f: f["structural_anomaly"]),
-    ("V7", "Vehicle", "Navigation alignment incomplete", "HOLD", lambda f: not f["nav_aligned"]),
-    ("V8", "Vehicle", "Payload not ready", "HOLD", lambda f: not f["payload_ready"]),
-    ("V9", "Vehicle", "Flight software version mismatch", "SCRUB", lambda f: f["software_mismatch"]),
-    ("V10", "Vehicle", "Backup flight computer not synced", "HOLD", lambda f: not f["backup_computer_synced"]),
-
-    # ---------------- Range safety (9) ----------------
-    ("R1", "Range Safety", "Boat in danger zone", "HOLD", lambda f: f["boat_in_zone"]),
-    ("R2", "Range Safety", "Aircraft in restricted airspace", "HOLD", lambda f: f["aircraft_in_zone"]),
-    ("R3", "Range Safety", "Tracking radar down", "HOLD", lambda f: not f["radar_ok"]),
-    ("R4", "Range Safety", "Range communications down", "HOLD", lambda f: not f["range_comms_ok"]),
-    ("R5", "Range Safety", "Termination command link failed", "SCRUB", lambda f: not f["termination_link_ok"]),
-    ("R6", "Range Safety", "Drone detected near pad", "HOLD", lambda f: f["drone_detected"]),
-    ("R7", "Range Safety", "Ship traffic downrange", "HOLD", lambda f: f["downrange_ship_traffic"]),
-    ("R8", "Range Safety", "Range safety officer says No-Go", "HOLD", lambda f: not f["rso_go"]),
-    ("R9", "Range Safety", "Recovery ship not in position", "HOLD", lambda f: not f["recovery_ship_ready"]),
-
-    # ---------------- Ground systems (9) ----------------
-    ("G1", "Ground", "Ground power failure", "HOLD", lambda f: not f["ground_power_ok"]),
-    ("G2", "Ground", "Control center comms down", "HOLD", lambda f: not f["control_comms_ok"]),
-    ("G3", "Ground", "Fire suppression fault", "HOLD", lambda f: not f["fire_suppression_ok"]),
-    ("G4", "Ground", "Pad water deluge fault", "HOLD", lambda f: not f["deluge_ok"]),
-    ("G5", "Ground", "Personnel still in pad area", "HOLD", lambda f: not f["personnel_clear"]),
-    ("G6", "Ground", "Hazardous gas detected on pad", "SCRUB", lambda f: f["hazard_gas"]),
-    ("G7", "Ground", "Backup power unavailable", "HOLD", lambda f: not f["backup_power_ok"]),
-    ("G8", "Ground", "Launch team staffing incomplete", "HOLD", lambda f: not f["staffing_complete"]),
-    ("G9", "Ground", "Umbilical retract fault", "SCRUB", lambda f: f["umbilical_fault"]),
-
-    # ---------------- Launch window (6) ----------------
-    ("L2", "Launch Window", "Countdown clock fault", "HOLD", lambda f: f["clock_fault"]),
-    ("L3", "Launch Window", "Orbital alignment error above 0.5 deg", "HOLD", lambda f: f["orbital_error"] > 0.5),
-    ("L4", "Launch Window", "Launch window already closed", "SCRUB", lambda f: f["minutes_to_close"] <= 0),
-    ("L5", "Launch Window", "More than 3 holds already used", "SCRUB", lambda f: f["holds_used"] > 3),
-    ("L6", "Launch Window", "Total hold time above 30 min", "SCRUB", lambda f: f["total_hold_minutes"] > 30),
-    # L1 is a compound rule: it needs to know whether any HOLD has fired,
-    # so it is placed last (the engine fills in "hold_active" before each rule).
-    ("L1", "Launch Window", "Window closing in under 2 min while a HOLD is active", "SCRUB",
-     lambda f: 0 < f["minutes_to_close"] < 2 and f["hold_active"]),
-]
+TOTAL_RULES = 56
 
 
-# ---------------------------------------------------------------------------
-# 3. INFERENCE ENGINE
-# ---------------------------------------------------------------------------
-def run_inference(facts):
-    """Check every rule against the facts and return (decision, fired_rules)."""
-    facts = dict(facts)
-    fired = []
+def check_launch(f):
+    """f is a dictionary of current facts, e.g. f["wind_speed"] = 12.
+    Returns: decision, scrub_reasons, hold_reasons"""
 
-    for rule_id, category, description, result, condition in RULES:
-        # working-memory fact used by compound rule L1
-        facts["hold_active"] = any(r["Result"] == "HOLD" for r in fired)
-        if condition(facts):
-            fired.append({
-                "ID": rule_id,
-                "Category": category,
-                "Condition": description,
-                "Result": result,
-            })
+    scrub = []   # reasons that CANCEL the launch
+    hold = []    # reasons that PAUSE the countdown
 
-    scrub_rules = [r for r in fired if r["Result"] == "SCRUB"]
-    hold_rules = [r for r in fired if r["Result"] == "HOLD"]
+    # ------------------------------------------------------------
+    # WEATHER RULES (13)
+    # ------------------------------------------------------------
+    if f["wind_speed"] > 30:
+        hold.append("W1: Wind speed above 30 kt")
 
-    # Conflict resolution: SCRUB beats HOLD, HOLD beats GO
-    if scrub_rules:
+    if f["wind_gust"] > 35:
+        hold.append("W2: Wind gusts above 35 kt")
+
+    if f["wind_shear_severe"]:
+        scrub.append("W3: Severe upper-level wind shear")
+
+    if f["lightning_distance"] < 10:
+        hold.append("W4: Lightning within 10 nm")
+
+    if f["thunderstorm"]:
+        hold.append("W5: Thunderstorm in launch area")
+
+    if f["cloud_ceiling"] < 6000:
+        hold.append("W6: Cloud ceiling below 6,000 ft")
+
+    if f["visibility"] < 4:
+        hold.append("W7: Visibility below 4 miles")
+
+    if f["temperature"] < 2:
+        hold.append("W8: Temperature below 2 C")
+
+    if f["temperature"] > 35:
+        hold.append("W9: Temperature above 35 C")
+
+    if f["rain"]:
+        hold.append("W10: Rain at launch site")
+
+    if f["tropical_warning"]:
+        scrub.append("W11: Tropical storm / hurricane warning")
+
+    if f["sea_state"] > 5:
+        hold.append("W12: Sea state above 5 in recovery area")
+
+    if f["solar_storm"]:
+        hold.append("W13: Severe solar / geomagnetic storm")
+
+    # ------------------------------------------------------------
+    # PROPULSION AND FUEL RULES (9)
+    # ------------------------------------------------------------
+    if f["fuel_leak"]:
+        scrub.append("P1: Fuel leak detected")
+
+    if f["tank_pressure"] < 210 or f["tank_pressure"] > 240:
+        hold.append("P2: Tank pressure outside 210-240 psi")
+
+    if f["propellant_temp"] < -186 or f["propellant_temp"] > -180:
+        hold.append("P3: Propellant temperature outside -186 to -180 C")
+
+    if not f["oxidizer_loaded"]:
+        hold.append("P4: Oxidizer loading incomplete")
+
+    if not f["chilldown_done"]:
+        hold.append("P5: Engine chilldown incomplete")
+
+    if f["valve_fault"]:
+        scrub.append("P6: Main valve fault")
+
+    if f["helium_pressure"] < 3000:
+        hold.append("P7: Helium pressurant below 3,000 psi")
+
+    if f["ignition_sensor_fault"]:
+        scrub.append("P8: Ignition sensor fault")
+
+    if f["fuel_level"] < 98:
+        hold.append("P9: Fuel level below 98 percent")
+
+    # ------------------------------------------------------------
+    # VEHICLE SYSTEMS RULES (10)
+    # ------------------------------------------------------------
+    if not f["telemetry_ok"]:
+        hold.append("V1: Telemetry lost")
+
+    if f["guidance_fault"]:
+        scrub.append("V2: Guidance computer fault")
+
+    if not f["avionics_ok"]:
+        hold.append("V3: Avionics self-check failed")
+
+    if f["battery"] < 90:
+        hold.append("V4: Battery charge below 90 percent")
+
+    if not f["fts_armed"]:
+        scrub.append("V5: Flight termination system not armed")
+
+    if f["structural_anomaly"]:
+        scrub.append("V6: Structural sensor anomaly")
+
+    if not f["nav_aligned"]:
+        hold.append("V7: Navigation alignment incomplete")
+
+    if not f["payload_ready"]:
+        hold.append("V8: Payload not ready")
+
+    if f["software_mismatch"]:
+        scrub.append("V9: Flight software version mismatch")
+
+    if not f["backup_computer_synced"]:
+        hold.append("V10: Backup flight computer not synced")
+
+    # ------------------------------------------------------------
+    # RANGE SAFETY RULES (9)
+    # ------------------------------------------------------------
+    if f["boat_in_zone"]:
+        hold.append("R1: Boat in danger zone")
+
+    if f["aircraft_in_zone"]:
+        hold.append("R2: Aircraft in restricted airspace")
+
+    if not f["radar_ok"]:
+        hold.append("R3: Tracking radar down")
+
+    if not f["range_comms_ok"]:
+        hold.append("R4: Range communications down")
+
+    if not f["termination_link_ok"]:
+        scrub.append("R5: Termination command link failed")
+
+    if f["drone_detected"]:
+        hold.append("R6: Drone detected near pad")
+
+    if f["downrange_ship_traffic"]:
+        hold.append("R7: Ship traffic downrange")
+
+    if not f["rso_go"]:
+        hold.append("R8: Range safety officer says No-Go")
+
+    if not f["recovery_ship_ready"]:
+        hold.append("R9: Recovery ship not in position")
+
+    # ------------------------------------------------------------
+    # GROUND SYSTEMS RULES (9)
+    # ------------------------------------------------------------
+    if not f["ground_power_ok"]:
+        hold.append("G1: Ground power failure")
+
+    if not f["control_comms_ok"]:
+        hold.append("G2: Control center comms down")
+
+    if not f["fire_suppression_ok"]:
+        hold.append("G3: Fire suppression fault")
+
+    if not f["deluge_ok"]:
+        hold.append("G4: Pad water deluge fault")
+
+    if not f["personnel_clear"]:
+        hold.append("G5: Personnel still in pad area")
+
+    if f["hazard_gas"]:
+        scrub.append("G6: Hazardous gas detected on pad")
+
+    if not f["backup_power_ok"]:
+        hold.append("G7: Backup power unavailable")
+
+    if not f["staffing_complete"]:
+        hold.append("G8: Launch team staffing incomplete")
+
+    if f["umbilical_fault"]:
+        scrub.append("G9: Umbilical retract fault")
+
+    # ------------------------------------------------------------
+    # LAUNCH WINDOW RULES (6)
+    # ------------------------------------------------------------
+    if f["clock_fault"]:
+        hold.append("L2: Countdown clock fault")
+
+    if f["orbital_error"] > 0.5:
+        hold.append("L3: Orbital alignment error above 0.5 deg")
+
+    if f["minutes_to_close"] <= 0:
+        scrub.append("L4: Launch window already closed")
+
+    if f["holds_used"] > 3:
+        scrub.append("L5: More than 3 holds already used")
+
+    if f["total_hold_minutes"] > 30:
+        scrub.append("L6: Total hold time above 30 min")
+
+    # L1 is checked last because it needs to know if any HOLD is active
+    if f["minutes_to_close"] > 0 and f["minutes_to_close"] < 2 and len(hold) > 0:
+        scrub.append("L1: Window closing in under 2 min while a HOLD is active")
+
+    # ------------------------------------------------------------
+    # FINAL DECISION (SCRUB beats HOLD, HOLD beats GO)
+    # ------------------------------------------------------------
+    if len(scrub) > 0:
         decision = "SCRUB"
-    elif hold_rules:
+    elif len(hold) > 0:
         decision = "HOLD"
     else:
         decision = "GO"
 
-    return decision, fired
-
-
-# ---------------------------------------------------------------------------
-# 4. PRESET SCENARIOS (only the facts that differ from DEFAULTS)
-# ---------------------------------------------------------------------------
-PRESETS = {
-    "Perfect Day": {},
-    "Thunderstorm": {
-        "thunderstorm": True, "lightning_distance": 6, "wind_speed": 34,
-        "cloud_ceiling": 3500, "rain": True,
-    },
-    "Fuel Leak": {"fuel_leak": True, "tank_pressure": 195},
-    "Boat in Range Zone": {"boat_in_zone": True},
-    "Closing Window": {"minutes_to_close": 1, "rso_go": False},
-    "Total Chaos": {
-        "wind_shear_severe": True, "lightning_distance": 4, "guidance_fault": True,
-        "hazard_gas": True, "telemetry_ok": False, "radar_ok": False,
-        "holds_used": 5, "minutes_to_close": 0,
-    },
-}
+    return decision, scrub, hold
