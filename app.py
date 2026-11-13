@@ -1,11 +1,3 @@
-"""
-app.py  -  The "face" (Streamlit UI) of the Launch Go/No-Go Expert System.
-
-This file only collects inputs and shows results.
-All rules live in rules.py.
-
-Run:  streamlit run app.py
-"""
 import streamlit as st
 
 from rules import check_launch, TOTAL_RULES
